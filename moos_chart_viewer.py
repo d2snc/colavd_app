@@ -31,15 +31,16 @@ AUX_MOOS_PORT   = 9002          # lancha A
 VAR_LAT, VAR_LONG, VAR_HEAD = "NAV_LAT", "NAV_LONG", "NAV_HEADING"
 
 ZOOM_WINDOW_PX  = 1000          # lado da janela de zoom (px)
-MAIN_SIZE_PX    = 40            # triângulo lancha B
-AUX_SIZE_PX     = 34            # triângulo lancha A
+MAIN_SIZE_PX    = 20            # triângulo lancha B
+AUX_SIZE_PX     = 20            # triângulo lancha A
 UPDATE_MS       = 400           # período da animação (ms)
 
 # Collision Avoidance
-COLLISION_DISTANCE_M = 500      # distância para ativar desvio (metros)
+COLLISION_DISTANCE_M = 30      # distância para ativar desvio (metros)
+COLLISION_CLEAR_M   = 60       # distância para desativar desvio (histerese)
 SAFETY_MARGIN_M     = 100       # margem de segurança adicional
-GRID_SIZE_M         = 50        # tamanho da célula do grid A* (metros)
-LOOKAHEAD_DISTANCE_M = 1000     # distância à frente para calcular rota
+GRID_SIZE_M         = 1        # tamanho da célula do grid A* (metros)
+LOOKAHEAD_DISTANCE_M = 200     # distância à frente para calcular rota
 
 # Origem do sistema de coordenadas local (Rio de Janeiro)
 LAT_ORIGIN = -22.93335
@@ -485,11 +486,13 @@ def main():
             collision_circle.set_center((c_A, r_A))
             collision_circle.set_radius(radius_px)
             
-            # Verificar se precisa ativar collision avoidance
-            if distance_to_A < COLLISION_DISTANCE_M and hdg_B is not None:
+            # Verificar se precisa ativar collision avoidance (com histerese)
+            activation_distance = COLLISION_DISTANCE_M if not collision_active else COLLISION_CLEAR_M
+            
+            if distance_to_A < activation_distance and hdg_B is not None:
                 if not collision_active:
                     collision_active = True
-                    info_lines.append("🚨 COLLISION AVOIDANCE ATIVO")
+                    info_lines.append("*** COLLISION AVOIDANCE ATIVO ***")
                     
                     # Calcular rota de desvio
                     waypoints = planner.plan_avoidance_path(
@@ -513,15 +516,28 @@ def main():
                         
                         avoidance_line.set_data(route_cols, route_rows)
                 else:
-                    info_lines.append("🚨 COLLISION AVOIDANCE ATIVO")
+                    info_lines.append("*** COLLISION AVOIDANCE ATIVO ***")
+                    
+                    # Manter a rota plotada enquanto estiver ativo
+                    if last_waypoints:
+                        route_cols, route_rows = [], []
+                        route_rows.append(r_B)
+                        route_cols.append(c_B)
+                        
+                        for wp_lat, wp_lon in last_waypoints:
+                            wp_r, wp_c = conv.latlon_to_pix(wp_lat, wp_lon, affine)
+                            route_rows.append(wp_r)
+                            route_cols.append(wp_c)
+                        
+                        avoidance_line.set_data(route_cols, route_rows)
             else:
                 if collision_active:
                     collision_active = False
                     last_waypoints = []
                     avoidance_line.set_data([], [])  # Limpar rota
-                    info_lines.append("✅ Rota Normal")
+                    info_lines.append("--- Retornando rota normal ---")
                 else:
-                    info_lines.append("✅ Navegação Normal")
+                    info_lines.append("Navegacao Normal")
         else:
             # Limpar círculo se não há dados
             collision_circle.set_radius(0)
