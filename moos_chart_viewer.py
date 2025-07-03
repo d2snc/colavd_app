@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from matplotlib.patches import RegularPolygon, Circle
 from matplotlib.lines import Line2D
-import pymoos
+import pymoos  # Commented out for testing
 from pyproj import CRS, Transformer
 
 # ───────── CONFIGURAÇÃO ───────── #
@@ -36,8 +36,8 @@ AUX_SIZE_PX     = 20            # triângulo lancha A
 UPDATE_MS       = 400           # período da animação (ms)
 
 # Collision Avoidance
-COLLISION_DISTANCE_M = 30      # distância para ativar desvio (metros)
-COLLISION_CLEAR_M   = 60       # distância para desativar desvio (histerese)
+COLLISION_DISTANCE_M = 100      # distância para ativar desvio (metros)
+COLLISION_CLEAR_M   = 150       # distância para desativar desvio (histerese)
 SAFETY_MARGIN_M     = 100       # margem de segurança adicional
 GRID_SIZE_M         = 1        # tamanho da célula do grid A* (metros)
 LOOKAHEAD_DISTANCE_M = 200     # distância à frente para calcular rota
@@ -228,143 +228,217 @@ def point_at_distance_bearing(lat: float, lon: float, distance_m: float, bearing
     
     return math.degrees(new_lat), math.degrees(new_lon)
 
-# ───── A* Path Planning ─────
+# ───────────────────────────── AStarPlanner ─────────────────────────────
 class AStarPlanner:
-    def __init__(self, grid_size_m: float = GRID_SIZE_M):
+    """
+    CAA-A* (Han et al., 2020) com suavização de trajetória
+    ------------------------------------------------------
+    • Changeable Action Space: cone ±Δψ, camadas e splits variam
+      em função do risco de colisão fuzzy (TCPA/DCPA – Tabela II).
+    • Custo: g_geom + w_risk·CR  (Lee & Rhee 2001).
+    • Pós-processamento:  Douglas-Peucker  →  Catmull-Rom spline
+      para um caminho suave e operacional.
+    """
+
+    # ——— parâmetros extraídos / ajustados dos artigos ———
+    _tcp_sets = [0, 20, 60, 120]              # limites TCPA (s)
+    _dcp_sets = [0, 0.1, 0.3, 0.6]            # limites DCPA (nm ≈ 111 m)
+    _risk_table = np.array(                   # grau fuzzy CR ∈ [0,1]
+        [[1.0, .95, .85, .70, .55],
+         [1.0, .90, .75, .60, .45],
+         [1.0, .85, .60, .45, .30],
+         [.95, .75, .50, .35, .20],
+         [.90, .60, .40, .25, .10]]
+    )
+
+    def __init__(self,
+                 grid_size_m: float = GRID_SIZE_M,
+                 w_risk: float = 50.0):
         self.grid_size = grid_size_m
-        
-    def plan_avoidance_path(self, 
-                           start_lat: float, start_lon: float, start_heading: float,
-                           obstacle_lat: float, obstacle_lon: float,
-                           lookahead_distance: float = LOOKAHEAD_DISTANCE_M) -> List[Tuple[float, float]]:
+        self.w_risk = w_risk
+
+    # ───────────────── API pública ─────────────────
+    def plan_avoidance_path(self,
+                            start_lat, start_lon, start_heading,
+                            obs_lat,   obs_lon,
+                            lookahead_distance=LOOKAHEAD_DISTANCE_M):
+
+        # destino “look-ahead” à frente da embarcação
+        tgt_lat, tgt_lon = point_at_distance_bearing(
+            start_lat, start_lon, lookahead_distance, start_heading)
+
+        # caixa de busca (±~1.6 km)
+        pad = 0.015
+        min_lat = min(start_lat, tgt_lat, obs_lat) - pad
+        max_lat = max(start_lat, tgt_lat, obs_lat) + pad
+        min_lon = min(start_lon, tgt_lon, obs_lon) - pad
+        max_lon = max(start_lon, tgt_lon, obs_lon) + pad
+
+        # converte para grade inteira
+        s = self._latlon_to_grid(start_lat, start_lon, min_lat, min_lon)
+        g = self._latlon_to_grid(tgt_lat,   tgt_lon,   min_lat, min_lon)
+        o = self._latlon_to_grid(obs_lat,   obs_lon,   min_lat, min_lon)
+
+        # executa A*
+        path = self._astar_caa(s, g, o, obs_lat, obs_lon,
+                               min_lat, min_lon, max_lat, max_lon)
+
+        if not path:   # fallback
+            return self._simple_avoidance_path(
+                start_lat, start_lon, start_heading,
+                obs_lat, obs_lon, tgt_lat, tgt_lon)
+
+        # grade → lat/lon
+        path_latlon = [self._grid_to_latlon(x, y, min_lat, min_lon)
+                       for x, y in path[1:]]           # pula nó inicial
+
+        # suaviza (RDP + Catmull-Rom)
+        return self._smooth_path(path_latlon)
+
+    # ────────── núcleo CAA-A* ──────────
+    def _astar_caa(self, s, g, o, obs_lat, obs_lon,
+                   min_lat, min_lon, max_lat, max_lon):
+
+        open_heap = [(0.0, s)]
+        came, g_cost = {s: None}, {s: 0.0}
+
+        while open_heap:
+            _, cur = heapq.heappop(open_heap)
+            if cur == g:
+                return self._reconstruct(came, cur)
+
+            # risco fuzzy neste nó
+            cur_lat, cur_lon = self._grid_to_latlon(
+                cur[0], cur[1], min_lat, min_lon)
+            risk = self._collision_risk(cur_lat, cur_lon, obs_lat, obs_lon)
+
+            # define Δψ, profundidade e splits (Fig. 2)
+            dpsi   = np.interp(risk, [0,1], [15, 90])      # graus
+            layers = int(np.interp(risk, [0,1], [2, 6]))
+            splits = int(np.interp(risk, [0,1], [3, 9]))
+
+            # gera vizinhos
+            for layer in range(1, layers+1):
+                step = layer
+                for k in range(-splits//2, splits//2+1):
+                    ang = math.radians(k * dpsi / splits)
+                    dx  = round(step*math.cos(ang))
+                    dy  = round(step*math.sin(ang))
+                    nxt = (cur[0]+dx, cur[1]+dy)
+
+                    # dentro da zona segura do obstáculo?
+                    if (nxt[0]-o[0])**2 + (nxt[1]-o[1])**2 <= \
+                       ((COLLISION_DISTANCE_M+SAFETY_MARGIN_M)/self.grid_size)**2:
+                        continue
+
+                    tentative_g = (g_cost[cur] + self.grid_size*layer +
+                                   self.w_risk * risk)
+
+                    if nxt not in g_cost or tentative_g < g_cost[nxt]:
+                        g_cost[nxt] = tentative_g
+                        came[nxt]   = cur
+                        f = tentative_g + self._heuristic(nxt, g)
+                        heapq.heappush(open_heap, (f, nxt))
+        return []  # falhou
+
+    # ────────── risco fuzzy TCPA/DCPA ──────────
+    def _collision_risk(self, lat, lon, obs_lat, obs_lon):
+        tcp = max(self._time_to_cpa(lat, lon, obs_lat, obs_lon), 0.1)
+        dcp = max(haversine_distance(lat, lon, obs_lat, obs_lon)/1852, 0.01)
+
+        tcp_i = min(np.digitize(tcp, self._tcp_sets), 4)
+        dcp_i = min(np.digitize(dcp, self._dcp_sets), 4)
+        return float(self._risk_table[dcp_i, tcp_i])
+
+    def _time_to_cpa(self, lat1, lon1, lat2, lon2, v_rel=2.0):
+        """Estimativa grosseira de TCPA (s)."""
+        dist = haversine_distance(lat1, lon1, lat2, lon2)
+        return dist / max(v_rel, 0.1)
+
+    # ────────── heurística & grade ──────────
+    def _heuristic(self, a, b):
+        return abs(a[0]-b[0]) + abs(a[1]-b[1])   # Manhattan
+
+    def _latlon_to_grid(self, lat, lon, min_lat, min_lon):
+        lat_m = haversine_distance(min_lat, min_lon, lat, min_lon)
+        lon_m = haversine_distance(min_lat, min_lon, min_lat, lon)
+        return int(lon_m/self.grid_size), int(lat_m/self.grid_size)
+
+    def _grid_to_latlon(self, gx, gy, min_lat, min_lon):
+        lat = min_lat + (gy*self.grid_size)/111_000
+        lon = min_lon + (gx*self.grid_size)/(111_000*math.cos(math.radians(min_lat)))
+        return lat, lon
+
+    def _reconstruct(self, came, node):
+        path = []
+        while node:
+            path.append(node)
+            node = came[node]
+        return path[::-1]
+
+    # ────────── suavização de caminho ──────────
+    def _simplify_rdp(self, pts, eps=2.0):
+        """Douglas-Peucker em XY locais (metros)."""
+        if len(pts) <= 2:
+            return pts
+        lat0 = pts[0][0]
+        kx = 111_000*math.cos(math.radians(lat0)); ky = 111_000
+        xy = np.c_[(np.array([p[1] for p in pts])-pts[0][1])*kx,
+                   (np.array([p[0] for p in pts])-pts[0][0])*ky]
+
+        # RDP recursivo
+        def rdp(lo, hi):
+            v = xy[hi]-xy[lo]; n = np.linalg.norm(v) or 1
+            d = np.abs(np.cross(v, xy[lo+1:hi]-xy[lo])/n)
+            if d.max() < eps:
+                return [lo, hi]
+            idx = lo+1+d.argmax()
+            return rdp(lo, idx)[:-1]+rdp(idx, hi)
+
+        keep = rdp(0, len(pts)-1)
+        return [pts[i] for i in keep]
+
+        # ────────── nova versão: densificação “segment wise” ──────────
+    def _smooth_path(self, pts, res_m=5.0):
         """
-        Planeja rota de desvio usando A*
-        Retorna lista de waypoints (lat, lon)
+        1) simplifica com RDP (mesmo código de antes, eps=2*grid)
+        2) percorre cada segmento p0-p1 e insere pontos a cada res_m
+        Retorna lista de (lat, lon) com espaçamento ~res_m.
         """
-        # Ponto de destino à frente da lancha
-        target_lat, target_lon = point_at_distance_bearing(
-            start_lat, start_lon, lookahead_distance, start_heading
-        )
-        
-        # Criar grid local ao redor da área
-        min_lat = min(start_lat, target_lat, obstacle_lat) - 0.01
-        max_lat = max(start_lat, target_lat, obstacle_lat) + 0.01
-        min_lon = min(start_lon, target_lon, obstacle_lon) - 0.01
-        max_lon = max(start_lon, target_lon, obstacle_lon) + 0.01
-        
-        # Converter para grid
-        start_grid = self._latlon_to_grid(start_lat, start_lon, min_lat, min_lon)
-        target_grid = self._latlon_to_grid(target_lat, target_lon, min_lat, min_lon)
-        obstacle_grid = self._latlon_to_grid(obstacle_lat, obstacle_lon, min_lat, min_lon)
-        
-        # Executar A*
-        path_grid = self._astar(start_grid, target_grid, obstacle_grid)
-        
-        if not path_grid:
-            # Se A* falhar, criar rota simples de desvio
-            return self._simple_avoidance_path(start_lat, start_lon, start_heading, 
-                                             obstacle_lat, obstacle_lon, target_lat, target_lon)
-        
-        # Converter path de volta para lat/lon
-        path_latlon = []
-        for grid_point in path_grid[1:]:  # Pular o ponto inicial
-            lat, lon = self._grid_to_latlon(grid_point[0], grid_point[1], min_lat, min_lon)
-            path_latlon.append((lat, lon))
-        
-        return path_latlon
-    
-    def _latlon_to_grid(self, lat: float, lon: float, min_lat: float, min_lon: float) -> Tuple[int, int]:
-        """Converte lat/lon para coordenadas de grid"""
-        # Aproximação simples - para uso local
-        lat_dist = haversine_distance(min_lat, min_lon, lat, min_lon)
-        lon_dist = haversine_distance(min_lat, min_lon, min_lat, lon)
-        
-        grid_x = int(lon_dist / self.grid_size)
-        grid_y = int(lat_dist / self.grid_size)
-        return (grid_x, grid_y)
-    
-    def _grid_to_latlon(self, grid_x: int, grid_y: int, min_lat: float, min_lon: float) -> Tuple[float, float]:
-        """Converte coordenadas de grid para lat/lon"""
-        lat_dist = grid_y * self.grid_size
-        lon_dist = grid_x * self.grid_size
-        
-        # Aproximação simples para conversão de volta
-        lat_per_meter = 1.0 / 111000  # Aproximadamente 1 grau = 111km
-        lon_per_meter = lat_per_meter / math.cos(math.radians(min_lat))
-        
-        lat = min_lat + lat_dist * lat_per_meter
-        lon = min_lon + lon_dist * lon_per_meter
-        return (lat, lon)
-    
-    def _astar(self, start: Tuple[int, int], goal: Tuple[int, int], 
-               obstacle: Tuple[int, int]) -> List[Tuple[int, int]]:
-        """Algoritmo A* simplificado"""
-        heap = [(0, start)]
-        came_from = {}
-        cost_so_far = {start: 0}
-        
-        # Criar área de obstáculo (círculo ao redor do obstáculo)
-        obstacle_radius = int((COLLISION_DISTANCE_M + SAFETY_MARGIN_M) / self.grid_size)
-        obstacle_cells = set()
-        for dx in range(-obstacle_radius, obstacle_radius + 1):
-            for dy in range(-obstacle_radius, obstacle_radius + 1):
-                if dx*dx + dy*dy <= obstacle_radius*obstacle_radius:
-                    obstacle_cells.add((obstacle[0] + dx, obstacle[1] + dy))
-        
-        directions = [(0,1), (1,0), (0,-1), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]
-        
-        while heap:
-            current_cost, current = heapq.heappop(heap)
-            
-            if current == goal:
-                # Reconstruir caminho
-                path = []
-                while current in came_from:
-                    path.append(current)
-                    current = came_from[current]
-                path.append(start)
-                return path[::-1]
-            
-            for dx, dy in directions:
-                neighbor = (current[0] + dx, current[1] + dy)
-                
-                # Verificar se está em obstáculo
-                if neighbor in obstacle_cells:
-                    continue
-                
-                new_cost = cost_so_far[current] + (1.4 if abs(dx) + abs(dy) == 2 else 1)
-                
-                if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
-                    cost_so_far[neighbor] = new_cost
-                    priority = new_cost + self._heuristic(neighbor, goal)
-                    heapq.heappush(heap, (priority, neighbor))
-                    came_from[neighbor] = current
-        
-        return []  # Caminho não encontrado
-    
-    def _heuristic(self, a: Tuple[int, int], b: Tuple[int, int]) -> float:
-        """Distância Manhattan como heurística"""
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-    
-    def _simple_avoidance_path(self, start_lat: float, start_lon: float, start_heading: float,
-                              obstacle_lat: float, obstacle_lon: float,
-                              target_lat: float, target_lon: float) -> List[Tuple[float, float]]:
-        """Rota de desvio simples quando A* falha"""
-        # Determinar lado para desvio (vira à direita por padrão)
-        avoidance_heading = (start_heading + 90) % 360
-        
-        # Ponto de desvio
-        avoidance_distance = COLLISION_DISTANCE_M + SAFETY_MARGIN_M
-        waypoint1_lat, waypoint1_lon = point_at_distance_bearing(
-            start_lat, start_lon, avoidance_distance, avoidance_heading
-        )
-        
-        # Ponto para retornar ao curso
-        waypoint2_lat, waypoint2_lon = point_at_distance_bearing(
-            waypoint1_lat, waypoint1_lon, avoidance_distance, start_heading
-        )
-        
-        return [(waypoint1_lat, waypoint1_lon), (waypoint2_lat, waypoint2_lon), (target_lat, target_lon)]
+        if len(pts) < 3:
+            return pts
+
+        # 1) simplificação
+        simp = self._simplify_rdp(pts, eps=2*self.grid_size)
+
+        # 2) densificação linear
+        out = [simp[0]]
+        for p0, p1 in zip(simp[:-1], simp[1:]):
+            dist = haversine_distance(*p0, *p1)
+            if dist < 1e-2:          # pontos coincidentes
+                continue
+            n_seg = max(int(dist // res_m), 1)
+            for k in range(1, n_seg+1):
+                frac = k / n_seg
+                lat = p0[0] + frac * (p1[0] - p0[0])
+                lon = p0[1] + frac * (p1[1] - p0[1])
+                out.append((lat, lon))
+        return out
+
+
+    # ────────── fallback simples ──────────
+    def _simple_avoidance_path(self, start_lat, start_lon, start_heading,
+                               obstacle_lat, obstacle_lon,
+                               target_lat, target_lon):
+        avoidance_heading   = (start_heading + 90) % 360
+        avoidance_distance  = COLLISION_DISTANCE_M + SAFETY_MARGIN_M
+        wp1 = point_at_distance_bearing(start_lat, start_lon,
+                                        avoidance_distance, avoidance_heading)
+        wp2 = point_at_distance_bearing(*wp1,
+                                        avoidance_distance, start_heading)
+        return [wp1, wp2, (target_lat, target_lon)]
+
+
 
 # ───────── aplicação ─────────
 def main():
